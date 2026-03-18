@@ -295,6 +295,155 @@ async def wait_for_botfather(client: "TelegramClient", timeout: int = 90) -> str
         client.remove_event_handler(_handler)
 
 
+def verify_token(token: str, expected_username: str) -> bool:
+    """
+    Call getMe to confirm the token is valid and its username matches
+    the BOT_USERNAME stored in .env.
+    Returns True if both checks pass.
+    """
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=10,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"  ERROR calling getMe: {e}")
+        return False
+
+    if not data.get("ok"):
+        print(f"  Token invalid — Telegram says: {data.get('description', 'unknown error')}")
+        return False
+
+    actual = data["result"].get("username", "")
+    expected_clean = expected_username.lstrip("@").lower()
+    actual_clean   = actual.lstrip("@").lower()
+
+    if actual_clean != expected_clean:
+        print(f"  Token mismatch — token belongs to @{actual}, not @{expected_username}")
+        return False
+
+    print(f"  Token OK — confirmed belongs to @{actual}")
+    return True
+
+
+async def verify_ownership(api_id: int, api_hash: str, phone: str, bot_user: str) -> bool:
+    """
+    Log in with Telethon (this phone number's session) and ask BotFather
+    for /mybots.  BotFather returns bot names as inline keyboard buttons
+    (not plain text), so we inspect message.buttons as well as raw_text.
+    Returns True if ownership confirmed.
+    """
+    session_name = f"session_{phone.replace('+', '').replace(' ', '')}"
+    client = TelegramClient(session_name, api_id, api_hash)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        print("  No saved session for this phone — sending auth code …")
+        await client.send_code_request(phone)
+        code = prompt("Auth code (from SMS / Telegram app)")
+        try:
+            await client.sign_in(phone, code)
+        except PhoneCodeInvalidError:
+            print("  ERROR: Invalid auth code.")
+            await client.disconnect()
+            return False
+        except SessionPasswordNeededError:
+            pw = prompt("Two-step verification password", secret=True)
+            await client.sign_in(password=pw)
+
+    bf = await client.get_entity("BotFather")
+
+    # Capture the full message object so we can read inline buttons
+    future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    @client.on(events.NewMessage(from_users="BotFather"))
+    async def _handler(event):
+        if not future.done():
+            future.set_result(event.message)
+
+    await client.send_message(bf, "/mybots")
+    try:
+        msg = await asyncio.wait_for(future, timeout=30)
+    except asyncio.TimeoutError:
+        msg = None
+    finally:
+        client.remove_event_handler(_handler)
+
+    await client.disconnect()
+
+    if not msg:
+        print("  No reply from BotFather — could not verify ownership.")
+        return False
+
+    bot_clean = bot_user.lstrip("@").lower()
+
+    # Check 1 — plain text (unlikely to contain the name, but cover it)
+    text_found = bot_clean in msg.raw_text.lower()
+
+    # Check 2 — inline keyboard buttons (this is where BotFather puts the bots)
+    button_found = False
+    if msg.buttons:
+        for row in msg.buttons:
+            for btn in row:
+                if bot_clean in btn.text.lower():
+                    button_found = True
+                    break
+
+    found = text_found or button_found
+
+    if found:
+        print(f"  Ownership OK — @{bot_user} is listed under this account.")
+    else:
+        print(f"  WARNING: @{bot_user} was NOT found in /mybots for this account.")
+        print(f"  BotFather replied:\n  {reply}")
+
+    return found
+
+
+def fetch_chat_id(token: str, bot_user: str, timeout: int = 120) -> int | None:
+    """
+    Instruct the user to send /start to the new bot, then poll
+    getUpdates until we receive a message and can extract the chat.id.
+    """
+    print(f"  Polling for incoming message from @{bot_user} …")
+
+    api_url  = f"https://api.telegram.org/bot{token}"
+    deadline = time.time() + timeout
+    offset   = 0
+
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                f"{api_url}/getUpdates",
+                params={"offset": offset, "timeout": 10, "limit": 1},
+                timeout=15,
+            )
+            data = resp.json()
+        except Exception as e:
+            print(f"  getUpdates error: {e}")
+            time.sleep(3)
+            continue
+
+        if data.get("ok") and data.get("result"):
+            update = data["result"][0]
+            offset = update["update_id"] + 1          # ack the update
+            msg    = update.get("message") or \
+                     update.get("edited_message") or \
+                     update.get("channel_post")
+            if msg and "chat" in msg:
+                chat_id = msg["chat"]["id"]
+                sender  = msg["chat"].get("username") or \
+                          msg["chat"].get("first_name", "unknown")
+                print(f"  Received message from {sender} — Chat ID: {chat_id}")
+                return chat_id
+
+    print("  Timed out waiting for a message. You can get the chat ID later by")
+    print(f"  sending /start to @{bot_user} and checking:")
+    print(f"  https://api.telegram.org/bot{token}/getUpdates")
+    return None
+
+
 async def phase2_create_bot(api_id: int, api_hash: str, phone: str):
     banner("Phase 2 — Create bot via @BotFather")
 
@@ -371,16 +520,34 @@ async def phase2_create_bot(api_id: int, api_hash: str, phone: str):
         print(f"  Username: @{bot_user}")
         print(f"  Token   : {token}")
 
-        # Persist token to .env
+        # Persist token first
         write_env("BOT_TOKEN",    token)
         write_env("BOT_USERNAME", bot_user)
         print("\n  BOT_TOKEN and BOT_USERNAME saved to .env")
+
+        # ── Step 3: auto-trigger the bot so we can read the chat ID ──────────
+        # Use the already-authenticated Telethon session to send /start to
+        # the new bot — no manual action required.
+        print(f"\n  Auto-sending /start to @{bot_user} via your account …")
+        try:
+            await client.send_message(bot_user, "/start")
+            print("  /start sent.")
+        except Exception as e:
+            print(f"  Could not auto-send /start: {e}")
+            print(f"  Please send any message to @{bot_user} manually in Telegram.")
+
+        await client.disconnect()
+
+        # ── Step 4: poll getUpdates to capture the chat ID ────────────────────
+        chat_id = fetch_chat_id(token, bot_user)
+        if chat_id:
+            write_env("CHAT_ID", str(chat_id))
+            print(f"  CHAT_ID={chat_id} saved to .env")
     else:
         print("  Could not parse bot token from BotFather reply.")
         if any(w in reply.lower() for w in ("username", "sorry", "taken")):
             print("  Hint: The username may already be taken. Try a different one.")
-
-    await client.disconnect()
+        await client.disconnect()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -424,6 +591,55 @@ async def main():
     except ValueError:
         print(f"ERROR: API_ID '{api_id_env}' is not an integer.")
         sys.exit(1)
+
+    # ── Optional: verify existing BOT_TOKEN / BOT_USERNAME ────────────────────
+    bot_token_env = os.getenv("BOT_TOKEN",    "").strip()
+    bot_user_env  = os.getenv("BOT_USERNAME", "").strip()
+
+    if bot_token_env and bot_user_env:
+        banner("Existing bot detected in .env — running verification")
+        print(f"  BOT_USERNAME : {bot_user_env}")
+        print(f"  BOT_TOKEN    : {bot_token_env[:10]}…\n")
+
+        # Check 1 — token valid and username matches
+        token_ok = verify_token(bot_token_env, bot_user_env)
+
+        # Check 2 — bot was created by this phone number's account
+        if token_ok:
+            print()
+            ownership_ok = await verify_ownership(
+                api_id, api_hash_env, phone, bot_user_env
+            )
+        else:
+            ownership_ok = False
+
+        if token_ok and ownership_ok:
+            print("\n  All checks passed — credentials are valid for this account.")
+
+            # Fetch CHAT_ID if missing
+            chat_id_env = os.getenv("CHAT_ID", "").strip()
+            if not chat_id_env:
+                print("  CHAT_ID not set — fetching now …")
+                session_name = f"session_{phone.replace('+', '').replace(' ', '')}"
+                client = TelegramClient(session_name, api_id, api_hash_env)
+                await client.connect()
+                try:
+                    await client.send_message(bot_user_env, "/start")
+                finally:
+                    await client.disconnect()
+                chat_id = fetch_chat_id(bot_token_env, bot_user_env)
+                if chat_id:
+                    write_env("CHAT_ID", str(chat_id))
+                    print(f"  CHAT_ID={chat_id} saved to .env")
+            else:
+                print(f"  CHAT_ID already set: {chat_id_env}")
+
+            action = prompt("\nCreate a new bot anyway? (y/N)").lower()
+            if action != "y":
+                print("\nDone.")
+                return
+        else:
+            print("\n  Verification failed — proceeding to create / fix credentials.")
 
     # ── Phase 2 ────────────────────────────────────────────────────────────────
     await phase2_create_bot(api_id, api_hash_env, phone)
